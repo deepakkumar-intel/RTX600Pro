@@ -2,29 +2,30 @@
 # =============================================================================
 # cx7_nic_benchmark.sh
 #
-# Description:
-#   Discover all ConnectX-7 (CX7) NIC RDMA devices on this host and run
-#   bandwidth and latency benchmarks across every unique pair using perftest.
+# Discovers all ConnectX-7 RDMA devices on this host and runs RDMA bandwidth
+# and latency benchmarks across every unique NIC pair using perftest.
 #
-#   Tests run per pair:
-#     Bandwidth : ib_send_bw, ib_write_bw, ib_read_bw
-#     Latency   : ib_send_lat, ib_write_lat, ib_read_lat
+# Tests per pair:
+#   ib_write_bw   — RDMA Write bandwidth
+#   ib_read_bw    — RDMA Read  bandwidth
+#   ib_write_lat  — RDMA Write latency
+#   ib_read_lat   — RDMA Read  latency
 #
 # Usage:
 #   bash cx7_nic_benchmark.sh [OPTIONS]
 #
 # Options:
-#   --bw-only          Run bandwidth tests only
-#   --lat-only         Run latency tests only
-#   --iters <N>        Number of iterations per test  (default: 1000)
-#   --size <bytes>     Message size for BW tests      (default: 65536)
-#   --output-dir <dir> Directory to save results      (default: ./cx7_results_<timestamp>)
-#   --port <N>         Base TCP port for perftest      (default: 18515)
-#   --no-color         Disable colored output
+#   --bw-only            Run bandwidth tests only
+#   --lat-only           Run latency tests only
+#   --iters   <N>        Iterations per test           (default: 1000)
+#   --size    <bytes>    Message size for BW tests     (default: 65536)
+#   --port    <N>        Base TCP port                 (default: 18515)
+#   --wait    <sec>      Seconds to wait for server    (default: 3)
+#   --output-dir <dir>   Directory for results         (default: ./cx7_results_<ts>)
+#   --no-color           Disable colour output
 #
-# Requirements:
+# Requirements (Ubuntu 24.04):
 #   sudo apt-get install -y perftest ibverbs-utils rdma-core
-#
 # =============================================================================
 
 set -euo pipefail
@@ -35,342 +36,321 @@ LAT_ONLY=false
 ITERS=1000
 BW_SIZE=65536
 BASE_PORT=18515
+SERVER_WAIT=3
 OUTPUT_DIR="./cx7_results_$(date +%Y%m%d_%H%M%S)"
 COLOR=true
 
-# ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bw-only)         BW_ONLY=true ;;
-        --lat-only)        LAT_ONLY=true ;;
-        --iters)           ITERS="$2";      shift ;;
-        --size)            BW_SIZE="$2";    shift ;;
-        --output-dir)      OUTPUT_DIR="$2"; shift ;;
-        --port)            BASE_PORT="$2";  shift ;;
-        --no-color)        COLOR=false ;;
+        --bw-only)    BW_ONLY=true ;;
+        --lat-only)   LAT_ONLY=true ;;
+        --iters)      ITERS="$2";       shift ;;
+        --size)       BW_SIZE="$2";     shift ;;
+        --port)       BASE_PORT="$2";   shift ;;
+        --wait)       SERVER_WAIT="$2"; shift ;;
+        --output-dir) OUTPUT_DIR="$2";  shift ;;
+        --no-color)   COLOR=false ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
 done
 
-# ── Colors ────────────────────────────────────────────────────────────────────
+# ── Colours ───────────────────────────────────────────────────────────────────
 if [[ "$COLOR" == "true" ]]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    BLUE='\033[1;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+    CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 else
-    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
 fi
 
 info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
-section() { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════${NC}"; \
-            echo -e "${BOLD}${BLUE}  $*${NC}"; \
-            echo -e "${BOLD}${BLUE}══════════════════════════════════════${NC}"; }
-pass()    { echo -e "  ${GREEN}✔${NC} $*"; }
-fail()    { echo -e "  ${RED}✘${NC} $*"; }
+hdr()     { echo -e "\n${BOLD}${CYAN}══  $*  ══${NC}"; }
 
-# ── Output directory + logging ────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 mkdir -p "$OUTPUT_DIR"
-SUMMARY_LOG="$OUTPUT_DIR/summary.log"
-CSV_FILE="$OUTPUT_DIR/results.csv"
-exec > >(tee -a "$SUMMARY_LOG") 2>&1
+LOG="$OUTPUT_DIR/summary.log"
+CSV="$OUTPUT_DIR/results.csv"
+exec > >(tee -a "$LOG") 2>&1
 
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║       CX7 NIC Bandwidth & Latency Benchmark              ║"
-echo "║       $(date '+%Y-%m-%d %H:%M:%S')                             ║"
-echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
-info "Output directory : $OUTPUT_DIR"
-info "Iterations       : $ITERS"
-info "BW message size  : $BW_SIZE bytes"
-info "Base port        : $BASE_PORT"
+echo "  CX7 RDMA Benchmark — $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  iters=${ITERS}  bw_size=${BW_SIZE}B  base_port=${BASE_PORT}  server_wait=${SERVER_WAIT}s"
+echo "  output → $OUTPUT_DIR"
+echo ""
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
-section "Checking Prerequisites"
+hdr "Prerequisites"
 
-REQUIRED_TOOLS=(ib_send_bw ib_send_lat ib_write_bw ib_write_lat ib_read_bw ib_read_lat ibv_devinfo)
+REQUIRED=(ib_write_bw ib_read_bw ib_write_lat ib_read_lat ibv_devinfo)
 MISSING=()
-for tool in "${REQUIRED_TOOLS[@]}"; do
-    if command -v "$tool" &>/dev/null; then
-        pass "$tool"
+for t in "${REQUIRED[@]}"; do
+    if command -v "$t" &>/dev/null; then
+        echo -e "  ${GREEN}✔${NC} $t"
     else
-        fail "$tool  (missing)"
-        MISSING+=("$tool")
+        echo -e "  ${RED}✘${NC} $t"
+        MISSING+=("$t")
     fi
 done
+[[ ${#MISSING[@]} -gt 0 ]] && \
+    error "Missing: ${MISSING[*]}\n  Fix: sudo apt-get install -y perftest ibverbs-utils rdma-core"
 
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    error "Missing tools: ${MISSING[*]}. Install with:\n  sudo apt-get install -y perftest ibverbs-utils rdma-core"
-fi
+# ── Discover devices ──────────────────────────────────────────────────────────
+hdr "Discovering ConnectX-7 Devices"
 
-# ── Discover CX7 devices ──────────────────────────────────────────────────────
-section "Discovering ConnectX-7 NIC Devices"
-
-# Map every mlx5 RDMA device to its PCI address, then check if it is CX7
-# CX7 PCI subsystem device ID = 0x1021 (Mellanox/NVIDIA)
-declare -A DEV_PCI       # rdma_dev → pci_addr
-declare -A DEV_NETDEV    # rdma_dev → netdev name
-declare -A DEV_IP        # rdma_dev → IPv4 address
-declare -A DEV_ROCE      # rdma_dev → "true" if RoCE, "false" if pure IB
-declare -A DEV_GID       # rdma_dev → GID index 0
-declare -a RDMA_DEVS     # ordered list of discovered devices
+declare -A DEV_NETDEV   # rdma_dev → netdev
+declare -A DEV_IP       # rdma_dev → IPv4 (empty = IB/no-IP mode)
+declare -a RDMA_DEVS    # ordered list
 
 for rdma_path in /sys/class/infiniband/mlx5_*/; do
     [[ -d "$rdma_path" ]] || continue
-    rdma_dev=$(basename "$rdma_path")
+    dev=$(basename "$rdma_path")
 
-    # Resolve PCI address
-    pci_addr=$(basename "$(readlink -f "${rdma_path}device")")
-    DEV_PCI["$rdma_dev"]="$pci_addr"
+    # Map to PCI address
+    pci=$(basename "$(readlink -f "${rdma_path}device")")
 
-    # Check if CX7 — PCI device ID 0x1021; also accept by name in lspci
-    pci_desc=$(lspci -s "$pci_addr" 2>/dev/null || true)
-    if echo "$pci_desc" | grep -qiE "ConnectX-7|0x1021"; then
-        is_cx7=true
-    else
-        # Fallback: accept any mlx5 Mellanox device if no strict CX7 found
-        is_cx7=false
-        echo "$pci_desc" | grep -qi "Mellanox" && is_cx7=true
-    fi
-
-    if [[ "$is_cx7" == "false" ]]; then
-        warn "Skipping $rdma_dev ($pci_addr) — not identified as CX7/Mellanox"
+    # Confirm CX7 or Mellanox
+    desc=$(lspci -s "$pci" 2>/dev/null || true)
+    if ! echo "$desc" | grep -qiE "ConnectX-7|0x1021|Mellanox|NVIDIA.*Network"; then
+        warn "Skipping $dev ($pci) — not CX7/Mellanox"
         continue
     fi
 
-    # Find associated netdev
+    # Netdev — try gid_attrs first, then device/net
     netdev=""
-    # Primary path: ports/1/gid_attrs/ndevs/
-    for ndev_file in "${rdma_path}ports/1/gid_attrs/ndevs/"*; do
-        [[ -f "$ndev_file" ]] && netdev=$(cat "$ndev_file") && break
+    for f in "${rdma_path}ports/1/gid_attrs/ndevs/"*; do
+        [[ -f "$f" ]] && netdev=$(cat "$f") && break
     done
-    # Fallback: device/net/
     if [[ -z "$netdev" ]]; then
-        for ndev_dir in "${rdma_path}device/net/"/; do
-            [[ -d "$ndev_dir" ]] && netdev=$(basename "$ndev_dir") && break
+        for d in "${rdma_path}device/net/*/"; do
+            [[ -d "$d" ]] && netdev=$(basename "$d") && break
         done
     fi
-    DEV_NETDEV["$rdma_dev"]="${netdev:-unknown}"
+    DEV_NETDEV["$dev"]="${netdev:-unknown}"
 
-    # Get IPv4 (RoCE mode)
-    ip_addr=""
+    # IPv4 (used for RoCE; absent = IB mode, use localhost for CM)
+    ip=""
     if [[ -n "$netdev" && "$netdev" != "unknown" ]]; then
-        ip_addr=$(ip -4 addr show "$netdev" 2>/dev/null \
-            | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | head -1 || true)
+        ip=$(ip -4 addr show "$netdev" 2>/dev/null \
+             | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | head -1 || true)
     fi
-    DEV_IP["$rdma_dev"]="${ip_addr:-}"
-    DEV_ROCE["$rdma_dev"]="$( [[ -n "$ip_addr" ]] && echo true || echo false )"
-
-    # Get GID for IB mode (index 0)
-    gid_file="${rdma_path}ports/1/gids/0"
-    DEV_GID["$rdma_dev"]="$( [[ -f "$gid_file" ]] && cat "$gid_file" || echo '' )"
-
-    RDMA_DEVS+=("$rdma_dev")
+    DEV_IP["$dev"]="${ip:-}"
+    RDMA_DEVS+=("$dev")
 
     echo ""
-    info "$rdma_dev"
-    echo "    PCI      : $pci_addr  ($pci_desc)"
-    echo "    Netdev   : ${DEV_NETDEV[$rdma_dev]}"
-    echo "    IP       : ${DEV_IP[$rdma_dev]:-N/A (IB mode)}"
-    echo "    RoCE     : ${DEV_ROCE[$rdma_dev]}"
+    info "$dev"
+    printf "      PCI    : %s\n" "$pci"
+    printf "      Netdev : %s\n" "${DEV_NETDEV[$dev]}"
+    printf "      IP     : %s\n" "${ip:-N/A (IB — will use localhost for CM)}"
 done
 
-NUM_DEVS=${#RDMA_DEVS[@]}
 echo ""
-if [[ $NUM_DEVS -lt 2 ]]; then
-    error "Found only $NUM_DEVS CX7 device(s). Need at least 2 for pair testing."
-fi
-info "Total CX7 devices found: $NUM_DEVS"
+NUM_DEVS=${#RDMA_DEVS[@]}
+[[ $NUM_DEVS -lt 2 ]] && error "Need ≥ 2 CX7 devices. Found: $NUM_DEVS"
+info "Total devices : $NUM_DEVS"
 
-# ── Generate all unique pairs ─────────────────────────────────────────────────
-section "Test Pairs (all combinations)"
+# ── Build all unique pairs ────────────────────────────────────────────────────
+hdr "Test Pairs  (N*(N-1)/2 = ${NUM_DEVS}*$(( NUM_DEVS - 1 ))/2)"
 
 declare -a PAIRS=()
-for (( i=0; i<NUM_DEVS; i++ )); do
-    for (( j=i+1; j<NUM_DEVS; j++ )); do
+for (( i = 0; i < NUM_DEVS; i++ )); do
+    for (( j = i + 1; j < NUM_DEVS; j++ )); do
         PAIRS+=("${RDMA_DEVS[$i]}:${RDMA_DEVS[$j]}")
+        echo "  ↔  ${RDMA_DEVS[$i]}  ←→  ${RDMA_DEVS[$j]}"
     done
 done
-
 TOTAL_PAIRS=${#PAIRS[@]}
-info "Pairs to test: $TOTAL_PAIRS  (N*(N-1)/2 = ${NUM_DEVS}*(${NUM_DEVS}-1)/2)"
-for pair in "${PAIRS[@]}"; do
-    echo "  ↔  $pair"
-done
 
 # ── CSV header ────────────────────────────────────────────────────────────────
-echo "pair,server_dev,client_dev,test,type,msg_size_bytes,bw_avg_GBs,bw_peak_GBs,lat_min_us,lat_max_us,lat_avg_us,lat_99p_us,status" \
-    > "$CSV_FILE"
+echo "pair,server,client,test,type,size_bytes,bw_avg_GBs,bw_peak_GBs,lat_min_us,lat_max_us,lat_avg_us,lat_99p_us,status" \
+    > "$CSV"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Port allocator (no (( n++ )) to avoid set -e exit-code trap) ─────────────
 NEXT_PORT=$BASE_PORT
 alloc_port() {
     local p=$NEXT_PORT
-    # Scan for in-use ports
     while ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}$"; do
-        (( p++ ))
+        p=$(( p + 1 ))
     done
     NEXT_PORT=$(( p + 1 ))
     echo "$p"
 }
 
-SERVER_PID=""
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+SRV_PID=""
 cleanup() {
-    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
+    if [[ -n "$SRV_PID" ]] && kill -0 "$SRV_PID" 2>/dev/null; then
+        kill "$SRV_PID" 2>/dev/null || true
+        wait "$SRV_PID" 2>/dev/null || true
     fi
-    # Belt-and-suspenders: kill any stray perftest servers
-    pkill -f "ib_send_bw --server\|ib_write_bw --server\|ib_read_bw\|ib_send_lat\|ib_write_lat\|ib_read_lat" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-# run_bw_test <binary> <srv_dev> <cli_dev> <srv_ip_or_empty> <port> <outfile>
-run_bw_test() {
-    local bin=$1 srv_dev=$2 cli_dev=$3 srv_ip=$4 port=$5 outfile=$6
-    local roce_flag=""
-    [[ -n "$srv_ip" ]] && roce_flag="-R"
+# ── run_rdma_bw <binary> <srv_dev> <cli_dev> <srv_ip> <port> <outfile> ───────
+# Sets globals: BW_AVG  BW_PEAK
+run_rdma_bw() {
+    local bin="$1" srv_dev="$2" cli_dev="$3" srv_ip="$4" port="$5" outfile="$6"
+    BW_AVG="N/A"; BW_PEAK="N/A"
 
-    # Server (background)
-    $bin --ib-dev "$srv_dev" -p "$port" \
-        --iters "$ITERS" -s "$BW_SIZE" \
-        $roce_flag \
+    # Build flags as array — avoids empty-string arg bugs
+    local -a flags=(-p "$port" --iters "$ITERS" -s "$BW_SIZE")
+    [[ -n "$srv_ip" ]] && flags+=(-R)   # enable RoCE only when IP is present
+
+    # Start server in background
+    "$bin" --ib-dev "$srv_dev" "${flags[@]}" \
         > "${outfile}.server" 2>&1 &
-    SERVER_PID=$!
-    sleep 2
+    SRV_PID=$!
+    sleep "$SERVER_WAIT"
 
-    # Client
-    $bin --ib-dev "$cli_dev" -p "$port" \
-        --iters "$ITERS" -s "$BW_SIZE" \
-        $roce_flag \
-        "${srv_ip:-127.0.0.1}" \
-        > "$outfile" 2>&1
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
+    # Abort if server already died
+    if ! kill -0 "$SRV_PID" 2>/dev/null; then
+        warn "Server exited early — check ${outfile}.server"
+        SRV_PID=""
+        return 1
+    fi
 
-    # Parse: last non-comment line — fields: bytes iters bw_peak bw_avg msgrate
-    local last_line
-    last_line=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^$' | tail -1)
-    BW_PEAK=$(echo "$last_line" | awk '{print $3}')
-    BW_AVG=$(echo  "$last_line" | awk '{print $4}')
+    # Connect client to server IP (RoCE) or localhost (IB CM)
+    local target="${srv_ip:-127.0.0.1}"
+    if "$bin" --ib-dev "$cli_dev" "${flags[@]}" "$target" \
+            > "$outfile" 2>&1; then
+        # perftest output last data line: bytes iters bw_peak bw_avg msgrate
+        local last
+        last=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^[[:space:]]*$' | tail -1)
+        BW_PEAK=$(awk '{print $3}' <<< "$last")
+        BW_AVG=$(awk  '{print $4}' <<< "$last")
+        wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+        return 0
+    else
+        wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+        return 1
+    fi
 }
 
-# run_lat_test <binary> <srv_dev> <cli_dev> <srv_ip_or_empty> <port> <outfile>
-run_lat_test() {
-    local bin=$1 srv_dev=$2 cli_dev=$3 srv_ip=$4 port=$5 outfile=$6
-    local roce_flag=""
-    [[ -n "$srv_ip" ]] && roce_flag="-R"
+# ── run_rdma_lat <binary> <srv_dev> <cli_dev> <srv_ip> <port> <outfile> ──────
+# Sets globals: LAT_MIN  LAT_MAX  LAT_AVG  LAT_99P
+run_rdma_lat() {
+    local bin="$1" srv_dev="$2" cli_dev="$3" srv_ip="$4" port="$5" outfile="$6"
+    LAT_MIN="N/A"; LAT_MAX="N/A"; LAT_AVG="N/A"; LAT_99P="N/A"
 
-    $bin --ib-dev "$srv_dev" -p "$port" \
-        --iters "$ITERS" \
-        $roce_flag \
+    local -a flags=(-p "$port" --iters "$ITERS")
+    [[ -n "$srv_ip" ]] && flags+=(-R)
+
+    "$bin" --ib-dev "$srv_dev" "${flags[@]}" \
         > "${outfile}.server" 2>&1 &
-    SERVER_PID=$!
-    sleep 2
+    SRV_PID=$!
+    sleep "$SERVER_WAIT"
 
-    $bin --ib-dev "$cli_dev" -p "$port" \
-        --iters "$ITERS" \
-        $roce_flag \
-        "${srv_ip:-127.0.0.1}" \
-        > "$outfile" 2>&1
-    wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
+    if ! kill -0 "$SRV_PID" 2>/dev/null; then
+        warn "Server exited early — check ${outfile}.server"
+        SRV_PID=""
+        return 1
+    fi
 
-    # Parse: last non-comment line — fields: bytes iters t_min t_max t_typical t_avg t_stdev 99p 99.9p
-    local last_line
-    last_line=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^$' | tail -1)
-    LAT_MIN=$(echo "$last_line"  | awk '{print $3}')
-    LAT_MAX=$(echo "$last_line"  | awk '{print $4}')
-    LAT_AVG=$(echo "$last_line"  | awk '{print $6}')
-    LAT_99P=$(echo "$last_line"  | awk '{print $8}')
+    local target="${srv_ip:-127.0.0.1}"
+    if "$bin" --ib-dev "$cli_dev" "${flags[@]}" "$target" \
+            > "$outfile" 2>&1; then
+        # perftest lat output last data line: bytes iters t_min t_max t_typical t_avg t_stdev 99p 99.9p
+        local last
+        last=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^[[:space:]]*$' | tail -1)
+        LAT_MIN=$(awk '{print $3}' <<< "$last")
+        LAT_MAX=$(awk '{print $4}' <<< "$last")
+        LAT_AVG=$(awk '{print $6}' <<< "$last")
+        LAT_99P=$(awk '{print $8}' <<< "$last")
+        wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+        return 0
+    else
+        wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
+        return 1
+    fi
 }
 
-# ── Run all tests ─────────────────────────────────────────────────────────────
-section "Running Benchmarks"
+# ── Main test loop ────────────────────────────────────────────────────────────
+hdr "Running RDMA Benchmarks"
 
 PAIR_IDX=0
 PASSED=0
 FAILED=0
 
 for pair in "${PAIRS[@]}"; do
-    (( PAIR_IDX++ ))
+    PAIR_IDX=$(( PAIR_IDX + 1 ))     # ← safe: var=$(( )) never returns exit 1
     srv_dev="${pair%%:*}"
     cli_dev="${pair##*:}"
-    pair_label="${srv_dev}_vs_${cli_dev}"
     srv_ip="${DEV_IP[$srv_dev]:-}"
+    mode="$( [[ -n "$srv_ip" ]] && echo "RoCE target=$srv_ip" || echo "IB CM=localhost" )"
 
     echo ""
-    echo -e "${BOLD}${CYAN}┌─ Pair [${PAIR_IDX}/${TOTAL_PAIRS}]: ${srv_dev} ↔ ${cli_dev} $( [[ -n "$srv_ip" ]] && echo "(RoCE: $srv_ip)" || echo "(IB mode)" ) ─${NC}"
-    echo -e "${BOLD}${CYAN}│${NC}  Server dev : $srv_dev  (${DEV_NETDEV[$srv_dev]})"
-    echo -e "${BOLD}${CYAN}│${NC}  Client dev : $cli_dev  (${DEV_NETDEV[$cli_dev]})"
-    echo -e "${BOLD}${CYAN}└───────────────────────────────────────────────────────${NC}"
+    echo -e "${BOLD}${CYAN}┌─ [${PAIR_IDX}/${TOTAL_PAIRS}]  ${srv_dev} ↔ ${cli_dev}  (${mode})${NC}"
+    echo -e "${BOLD}${CYAN}│${NC}  srv: $srv_dev  netdev=${DEV_NETDEV[$srv_dev]}"
+    echo -e "${BOLD}${CYAN}│${NC}  cli: $cli_dev  netdev=${DEV_NETDEV[$cli_dev]}"
+    echo -e "${BOLD}${CYAN}└──────────────────────────────────────────────────────${NC}"
 
-    pair_dir="$OUTPUT_DIR/${pair_label}"
+    pair_dir="$OUTPUT_DIR/${srv_dev}_vs_${cli_dev}"
     mkdir -p "$pair_dir"
 
-    # ── Bandwidth Tests ────────────────────────────────────────────────────────
+    # ── RDMA Bandwidth ─────────────────────────────────────────────────────────
     if [[ "$LAT_ONLY" == "false" ]]; then
-        for bw_bin in ib_send_bw ib_write_bw ib_read_bw; do
+        for bin in ib_write_bw ib_read_bw; do
             port=$(alloc_port)
-            outfile="${pair_dir}/${bw_bin}.txt"
-            printf "  %-20s (port %-5s) ... " "$bw_bin" "$port"
+            out="${pair_dir}/${bin}.txt"
+            printf "  %-16s  port=%-6s  " "$bin" "$port"
 
-            BW_PEAK="N/A"; BW_AVG="N/A"; status="PASS"
-            if run_bw_test "$bw_bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$outfile" 2>/dev/null; then
+            if run_rdma_bw "$bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$out"; then
                 echo -e "${GREEN}PASS${NC}  avg=${BW_AVG} GB/s  peak=${BW_PEAK} GB/s"
-                (( PASSED++ ))
+                PASSED=$(( PASSED + 1 ))
+                status="PASS"
             else
-                status="FAIL"; echo -e "${RED}FAIL${NC}  (see $outfile)"
-                (( FAILED++ ))
+                echo -e "${RED}FAIL${NC}  → $out  ${out}.server"
+                FAILED=$(( FAILED + 1 ))
+                BW_AVG="N/A"; BW_PEAK="N/A"; status="FAIL"
             fi
-            echo "${pair},${srv_dev},${cli_dev},${bw_bin},bandwidth,${BW_SIZE},${BW_AVG},${BW_PEAK},,,,${status}" >> "$CSV_FILE"
+            echo "${pair},${srv_dev},${cli_dev},${bin},bandwidth,${BW_SIZE},${BW_AVG},${BW_PEAK},,,,$status" \
+                >> "$CSV"
         done
     fi
 
-    # ── Latency Tests ──────────────────────────────────────────────────────────
+    # ── RDMA Latency ──────────────────────────────────────────────────────────
     if [[ "$BW_ONLY" == "false" ]]; then
-        for lat_bin in ib_send_lat ib_write_lat ib_read_lat; do
+        for bin in ib_write_lat ib_read_lat; do
             port=$(alloc_port)
-            outfile="${pair_dir}/${lat_bin}.txt"
-            printf "  %-20s (port %-5s) ... " "$lat_bin" "$port"
+            out="${pair_dir}/${bin}.txt"
+            printf "  %-16s  port=%-6s  " "$bin" "$port"
 
-            LAT_MIN="N/A"; LAT_MAX="N/A"; LAT_AVG="N/A"; LAT_99P="N/A"; status="PASS"
-            if run_lat_test "$lat_bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$outfile" 2>/dev/null; then
+            if run_rdma_lat "$bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$out"; then
                 echo -e "${GREEN}PASS${NC}  avg=${LAT_AVG} us  min=${LAT_MIN} us  max=${LAT_MAX} us  99p=${LAT_99P} us"
-                (( PASSED++ ))
+                PASSED=$(( PASSED + 1 ))
+                status="PASS"
             else
-                status="FAIL"; echo -e "${RED}FAIL${NC}  (see $outfile)"
-                (( FAILED++ ))
+                echo -e "${RED}FAIL${NC}  → $out  ${out}.server"
+                FAILED=$(( FAILED + 1 ))
+                LAT_MIN="N/A"; LAT_MAX="N/A"; LAT_AVG="N/A"; LAT_99P="N/A"; status="FAIL"
             fi
-            echo "${pair},${srv_dev},${cli_dev},${lat_bin},latency,1,,,${LAT_MIN},${LAT_MAX},${LAT_AVG},${LAT_99P},${status}" >> "$CSV_FILE"
+            echo "${pair},${srv_dev},${cli_dev},${bin},latency,1,,,$LAT_MIN,$LAT_MAX,$LAT_AVG,$LAT_99P,$status" \
+                >> "$CSV"
         done
     fi
 done
 
-# ── Summary table ─────────────────────────────────────────────────────────────
-section "Results Summary"
-
+# ── Summary ───────────────────────────────────────────────────────────────────
+hdr "Results Summary"
 echo ""
-printf "${BOLD}%-28s %-18s %-10s %-12s %-12s %-12s %-12s${NC}\n" \
-    "Pair" "Test" "Status" "BW Avg GB/s" "BW Peak GB/s" "Lat Avg us" "Lat 99p us"
-printf '%.0s─' {1..106}; echo ""
+printf "${BOLD}%-26s %-16s %-8s %-13s %-13s %-12s %-12s${NC}\n" \
+    "Pair" "Test" "Status" "BW Avg(GB/s)" "BW Peak(GB/s)" "Lat Avg(us)" "Lat 99p(us)"
+printf '%.0s─' {1..100}; echo ""
 
-tail -n +2 "$CSV_FILE" | while IFS=',' read -r pair srv cli test type size bw_avg bw_peak lat_min lat_max lat_avg lat_99p status; do
-    status_color="${GREEN}"
-    [[ "$status" == "FAIL" ]] && status_color="${RED}"
-    printf "%-28s %-18s ${status_color}%-10s${NC} %-12s %-12s %-12s %-12s\n" \
+tail -n +2 "$CSV" | while IFS=',' read -r pair srv cli test type size \
+        bw_avg bw_peak lat_min lat_max lat_avg lat_99p status; do
+    [[ "$status" == "PASS" ]] && sc="${GREEN}" || sc="${RED}"
+    printf "%-26s %-16s ${sc}%-8s${NC} %-13s %-13s %-12s %-12s\n" \
         "$pair" "$test" "$status" \
         "${bw_avg:--}" "${bw_peak:--}" "${lat_avg:--}" "${lat_99p:--}"
 done
 
 echo ""
-echo "────────────────────────────────────────"
-echo -e "  Total pairs tested : ${TOTAL_PAIRS}"
-echo -e "  Tests ${GREEN}passed${NC}         : ${PASSED}"
-echo -e "  Tests ${RED}failed${NC}         : ${FAILED}"
-echo "────────────────────────────────────────"
+echo    "  Pairs tested : $TOTAL_PAIRS"
+echo -e "  Passed       : ${GREEN}${PASSED}${NC}"
+echo -e "  Failed       : ${RED}${FAILED}${NC}"
 echo ""
-info "Full results saved to : $OUTPUT_DIR/"
-info "CSV summary           : $CSV_FILE"
-info "Per-pair raw logs     : $OUTPUT_DIR/<pair>/<test>.txt"
+info "Log : $LOG"
+info "CSV : $CSV"
+info "Raw : $OUTPUT_DIR/<pair>/<test>.txt[.server]"
