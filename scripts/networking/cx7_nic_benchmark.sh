@@ -223,7 +223,7 @@ done
 TOTAL_PAIRS=${#PAIRS[@]}
 
 # ── CSV header ────────────────────────────────────────────────────────────────
-echo "pair,server,client,test,type,size_bytes,bw_avg_GBs,bw_peak_GBs,lat_min_us,lat_max_us,lat_avg_us,lat_99p_us,status" \
+echo "pair,server,client,test,type,size_bytes,bw_avg_MBs,bw_peak_MBs,lat_min_us,lat_max_us,lat_avg_us,lat_99p_us,status" \
     > "$CSV"
 
 # ── Port allocator (no (( n++ )) to avoid set -e exit-code trap) ─────────────
@@ -276,7 +276,7 @@ run_rdma_bw() {
             > "$outfile" 2>&1; then
         # Data lines start with whitespace + digit; filters out headers (#bytes)
         # and trailing separator lines (------) that fool tail -1
-        # perftest BW columns: bytes  iters  bw_peak(GB/s)  bw_avg(GB/s)  msgrate
+        # perftest BW columns: bytes  iters  bw_peak(MB/s)  bw_avg(MB/s)  msgrate
         local last
         last=$(grep -E '^\s+[0-9]' "$outfile" | tail -1)
         BW_PEAK=$(awk '{print $3}' <<< "$last")
@@ -360,7 +360,7 @@ for pair in "${PAIRS[@]}"; do
                 printf "  %-16s  size=%-12s  port=%-6s  " "$bin" "${msg_size}B" "$port"
 
                 if run_rdma_bw "$bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$out" "$msg_size"; then
-                    echo -e "${GREEN}PASS${NC}  avg=${BW_AVG} GB/s  peak=${BW_PEAK} GB/s"
+                    echo -e "${GREEN}PASS${NC}  avg=${BW_AVG} MB/s  peak=${BW_PEAK} MB/s"
                     PASSED=$(( PASSED + 1 ))
                     status="PASS"
                 else
@@ -454,7 +454,7 @@ END {
     printf "\n"
     printf BOLD "%-26s %-16s %-12s %-8s %-13s %-13s %-12s %-12s  %s\n" NC,
         "Pair", "Test", "Size(B)", "Status",
-        "BW Avg(GB/s)", "BW Peak(GB/s)", "Lat Avg(us)", "Lat 99p(us)", "Anomaly"
+        "BW Avg(MB/s)", "BW Peak(MB/s)", "Lat Avg(us)", "Lat 99p(us)", "Anomaly"
     for (i=1;i<=122;i++) printf "─"; printf "\n"
 
     anomaly_count = 0
@@ -525,7 +525,7 @@ END {
     # Per-test mean reference row
     printf BOLD "\n  Per-test mean values (baseline for anomaly detection):\n" NC
     printf "  %-16s  %-12s  %-20s  %-20s  %-20s  %-20s\n",
-        "Test", "Size(B)", "BW Avg mean(GB/s)", "BW Peak mean(GB/s)", "Lat Avg mean(us)", "Lat 99p mean(us)"
+        "Test", "Size(B)", "BW Avg mean(MB/s)", "BW Peak mean(MB/s)", "Lat Avg mean(us)", "Lat 99p mean(us)"
     printf "  %-16s  %-12s  %-20s  %-20s  %-20s  %-20s\n",
         "────────────────","────────────","────────────────────","────────────────────","────────────────────","────────────────────"
     # collect all test:size keys
