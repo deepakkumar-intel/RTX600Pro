@@ -15,14 +15,20 @@
 #   bash cx7_nic_benchmark.sh [OPTIONS]
 #
 # Options:
-#   --bw-only            Run bandwidth tests only
-#   --lat-only           Run latency tests only
-#   --iters   <N>        Iterations per test           (default: 1000)
-#   --size    <bytes>    Message size for BW tests     (default: 65536)
-#   --port    <N>        Base TCP port                 (default: 18515)
-#   --wait    <sec>      Seconds to wait for server    (default: 3)
-#   --output-dir <dir>   Directory for results         (default: ./cx7_results_<ts>)
-#   --no-color           Disable colour output
+#   --bw-only              Run bandwidth tests only
+#   --lat-only             Run latency tests only
+#   --iters      <N>       Iterations per test                   (default: 1000)
+#   --size       <size>    Single message size for BW tests
+#                            Accepts K/M/G suffix or plain bytes
+#                            Examples: 65536  64K  1M  4G        (default: 65536)
+#   --size-range <s>-<e>   Message size range for BW tests; runs 2× steps from
+#                            start to end.  Both ends accept K/M/G or plain bytes.
+#                            Examples: 64K-1G  512K-4G  65536-1073741824
+#                            (--size and --size-range are mutually exclusive)
+#   --port       <N>       Base TCP port                         (default: 18515)
+#   --wait       <sec>     Seconds to wait for server            (default: 3)
+#   --output-dir <dir>     Directory for results    (default: ./cx7_results_<ts>)
+#   --no-color             Disable colour output
 #
 # Requirements (Ubuntu 24.04):
 #   sudo apt-get install -y perftest ibverbs-utils rdma-core
@@ -34,7 +40,9 @@ set -euo pipefail
 BW_ONLY=false
 LAT_ONLY=false
 ITERS=1000
-BW_SIZE=65536
+BW_SIZE="65536"        # single size (raw input, K/M/G or bytes)
+BW_SIZE_RANGE=""       # range input e.g. "64K-1G" (empty = use BW_SIZE)
+BW_SIZE_LIST=()        # expanded byte values (filled after arg parsing)
 BASE_PORT=18515
 SERVER_WAIT=3
 OUTPUT_DIR="./cx7_results_$(date +%Y%m%d_%H%M%S)"
@@ -44,16 +52,20 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --bw-only)    BW_ONLY=true ;;
         --lat-only)   LAT_ONLY=true ;;
-        --iters)      ITERS="$2";       shift ;;
-        --size)       BW_SIZE="$2";     shift ;;
-        --port)       BASE_PORT="$2";   shift ;;
-        --wait)       SERVER_WAIT="$2"; shift ;;
-        --output-dir) OUTPUT_DIR="$2";  shift ;;
+        --iters)      ITERS="$2";          shift ;;
+        --size)       BW_SIZE="$2";        shift ;;
+        --size-range) BW_SIZE_RANGE="$2";  shift ;;
+        --port)       BASE_PORT="$2";      shift ;;
+        --wait)       SERVER_WAIT="$2";    shift ;;
+        --output-dir) OUTPUT_DIR="$2";     shift ;;
         --no-color)   COLOR=false ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
 done
+
+[[ -n "$BW_SIZE_RANGE" && "$BW_SIZE" != "65536" ]] && \
+    { echo "Error: --size and --size-range are mutually exclusive"; exit 1; }
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 if [[ "$COLOR" == "true" ]]; then
@@ -74,9 +86,57 @@ LOG="$OUTPUT_DIR/summary.log"
 CSV="$OUTPUT_DIR/results.csv"
 exec > >(tee -a "$LOG") 2>&1
 
+# ── Size helpers ──────────────────────────────────────────────────────────────
+# parse_size: translate K/M/G suffix → bytes  (case-insensitive)
+#   parse_size 64K  → 65536
+#   parse_size 1G   → 1073741824
+#   parse_size 65536 → 65536
+parse_size() {
+    local raw="${1^^}"           # uppercase
+    local suf="${raw: -1}"       # last char
+    local num="${raw%[KMG]}"     # strip suffix
+    if   [[ "$suf" == "G" ]]; then echo $(( num * 1024 * 1024 * 1024 ))
+    elif [[ "$suf" == "M" ]]; then echo $(( num * 1024 * 1024 ))
+    elif [[ "$suf" == "K" ]]; then echo $(( num * 1024 ))
+    else echo "$num"
+    fi
+}
+
+# build_size_list: populate BW_SIZE_LIST
+#   --size  64K       → (65536)
+#   --size-range 64K-1G → (65536 131072 … 1073741824)   doubles each step
+build_size_list() {
+    if [[ -n "$BW_SIZE_RANGE" ]]; then
+        # Validate and split range "START-END"
+        if [[ ! "$BW_SIZE_RANGE" =~ ^([0-9]+[KkMmGg]?)-([0-9]+[KkMmGg]?)$ ]]; then
+            error "--size-range must be <start>-<end>  e.g. 64K-1G  or  65536-1073741824"
+        fi
+        local start end s
+        start=$(parse_size "${BASH_REMATCH[1]}")
+        end=$(parse_size   "${BASH_REMATCH[2]}")
+        [[ $start -lt 1    ]] && error "--size-range start must be ≥ 1"
+        [[ $start -gt $end ]] && error "--size-range start must be ≤ end"
+        s=$start
+        while (( s <= end )); do
+            BW_SIZE_LIST+=("$s")
+            s=$(( s * 2 ))
+        done
+    else
+        BW_SIZE_LIST+=("$(parse_size "$BW_SIZE")")
+    fi
+}
+build_size_list
+
+# Human-readable description of the sizes to be tested
+if [[ ${#BW_SIZE_LIST[@]} -eq 1 ]]; then
+    BW_SIZE_DESC="${BW_SIZE_LIST[0]}B"
+else
+    BW_SIZE_DESC="${BW_SIZE_RANGE}  (${#BW_SIZE_LIST[@]} steps: ${BW_SIZE_LIST[0]}B … ${BW_SIZE_LIST[-1]}B)"
+fi
+
 echo ""
 echo "  CX7 RDMA Benchmark — $(date '+%Y-%m-%d %H:%M:%S')"
-echo "  iters=${ITERS}  bw_size=${BW_SIZE}B  base_port=${BASE_PORT}  server_wait=${SERVER_WAIT}s"
+echo "  iters=${ITERS}  bw_size=${BW_SIZE_DESC}  base_port=${BASE_PORT}  server_wait=${SERVER_WAIT}s"
 echo "  output → $OUTPUT_DIR"
 echo ""
 
@@ -190,11 +250,11 @@ trap cleanup EXIT INT TERM
 # ── run_rdma_bw <binary> <srv_dev> <cli_dev> <srv_ip> <port> <outfile> ───────
 # Sets globals: BW_AVG  BW_PEAK
 run_rdma_bw() {
-    local bin="$1" srv_dev="$2" cli_dev="$3" srv_ip="$4" port="$5" outfile="$6"
+    local bin="$1" srv_dev="$2" cli_dev="$3" srv_ip="$4" port="$5" outfile="$6" msg_size="$7"
     BW_AVG="N/A"; BW_PEAK="N/A"
 
     # Build flags as array — avoids empty-string arg bugs
-    local -a flags=(-p "$port" --iters "$ITERS" -s "$BW_SIZE")
+    local -a flags=(-p "$port" --iters "$ITERS" -s "$msg_size")
     [[ -n "$srv_ip" ]] && flags+=(-R)   # enable RoCE only when IP is present
 
     # Start server in background
@@ -294,21 +354,23 @@ for pair in "${PAIRS[@]}"; do
     # ── RDMA Bandwidth ─────────────────────────────────────────────────────────
     if [[ "$LAT_ONLY" == "false" ]]; then
         for bin in ib_write_bw ib_read_bw; do
-            port=$(alloc_port)
-            out="${pair_dir}/${bin}.txt"
-            printf "  %-16s  port=%-6s  " "$bin" "$port"
+            for msg_size in "${BW_SIZE_LIST[@]}"; do
+                port=$(alloc_port)
+                out="${pair_dir}/${bin}_${msg_size}B.txt"
+                printf "  %-16s  size=%-12s  port=%-6s  " "$bin" "${msg_size}B" "$port"
 
-            if run_rdma_bw "$bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$out"; then
-                echo -e "${GREEN}PASS${NC}  avg=${BW_AVG} GB/s  peak=${BW_PEAK} GB/s"
-                PASSED=$(( PASSED + 1 ))
-                status="PASS"
-            else
-                echo -e "${RED}FAIL${NC}  → $out  ${out}.server"
-                FAILED=$(( FAILED + 1 ))
-                BW_AVG="N/A"; BW_PEAK="N/A"; status="FAIL"
-            fi
-            echo "${pair},${srv_dev},${cli_dev},${bin},bandwidth,${BW_SIZE},${BW_AVG},${BW_PEAK},,,,$status" \
-                >> "$CSV"
+                if run_rdma_bw "$bin" "$srv_dev" "$cli_dev" "$srv_ip" "$port" "$out" "$msg_size"; then
+                    echo -e "${GREEN}PASS${NC}  avg=${BW_AVG} GB/s  peak=${BW_PEAK} GB/s"
+                    PASSED=$(( PASSED + 1 ))
+                    status="PASS"
+                else
+                    echo -e "${RED}FAIL${NC}  → $out  ${out}.server"
+                    FAILED=$(( FAILED + 1 ))
+                    BW_AVG="N/A"; BW_PEAK="N/A"; status="FAIL"
+                fi
+                echo "${pair},${srv_dev},${cli_dev},${bin},bandwidth,${msg_size},${BW_AVG},${BW_PEAK},,,,$status" \
+                    >> "$CSV"
+            done
         done
     fi
 
@@ -352,7 +414,7 @@ awk -v thresh="$ANOMALY_THRESH" \
     FS=","
     # column indices (1-based, header row skipped)
     # pair,server,client,test,type,size,bw_avg,bw_peak,lat_min,lat_max,lat_avg,lat_99p,status
-    C_PAIR=1; C_TEST=4; C_TYPE=5
+    C_PAIR=1; C_TEST=4; C_TYPE=5; C_SIZE=6
     C_BW_AVG=7; C_BW_PEAK=8
     C_LAT_AVG=11; C_LAT_99P=12
     C_STATUS=13
@@ -363,7 +425,7 @@ NR==1 { next }   # skip CSV header
     test   = $C_TEST
     type   = $C_TYPE
     status = $C_STATUS
-    key    = test               # group anomaly detection by test binary
+    key    = test ":" $C_SIZE   # group anomaly detection by test + message size
 
     rows[NR] = $0               # store entire row
 
@@ -390,10 +452,10 @@ END {
 
     # Header
     printf "\n"
-    printf BOLD "%-26s %-16s %-8s %-13s %-13s %-12s %-12s  %s\n" NC,
-        "Pair", "Test", "Status",
+    printf BOLD "%-26s %-16s %-12s %-8s %-13s %-13s %-12s %-12s  %s\n" NC,
+        "Pair", "Test", "Size(B)", "Status",
         "BW Avg(GB/s)", "BW Peak(GB/s)", "Lat Avg(us)", "Lat 99p(us)", "Anomaly"
-    for (i=1;i<=110;i++) printf "─"; printf "\n"
+    for (i=1;i<=122;i++) printf "─"; printf "\n"
 
     anomaly_count = 0
 
@@ -405,7 +467,7 @@ END {
         test   = f[C_TEST]
         type   = f[C_TYPE]
         status = f[C_STATUS]
-        key    = test
+        key    = f[C_TEST] ":" f[C_SIZE]
 
         bw_avg  = f[C_BW_AVG]  + 0
         bw_peak = f[C_BW_PEAK] + 0
@@ -451,34 +513,34 @@ END {
 
         if (anomalies != "") anomaly_count++
 
-        printf "%-26s %-16s " sc "%-8s" NC " %-13s %-13s %-12s %-12s  %s\n",
-            pair, test, status,
+        printf "%-26s %-16s %-12s " sc "%-8s" NC " %-13s %-13s %-12s %-12s  %s\n",
+            pair, test, f[C_SIZE]"B", status,
             bw_avg_s, bw_peak_s, lat_avg_s, lat_99p_s,
             anom_col
     }
 
     printf "\n"
-    for (i=1;i<=110;i++) printf "─"; printf "\n"
+    for (i=1;i<=122;i++) printf "─"; printf "\n"
 
     # Per-test mean reference row
     printf BOLD "\n  Per-test mean values (baseline for anomaly detection):\n" NC
-    printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n",
-        "Test", "BW Avg mean(GB/s)", "BW Peak mean(GB/s)", "Lat Avg mean(us)", "Lat 99p mean(us)"
-    printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n",
-        "────────────────","────────────────────","────────────────────","────────────────────","────────────────────"
-    # collect all test keys
+    printf "  %-16s  %-12s  %-20s  %-20s  %-20s  %-20s\n",
+        "Test", "Size(B)", "BW Avg mean(GB/s)", "BW Peak mean(GB/s)", "Lat Avg mean(us)", "Lat 99p mean(us)"
+    printf "  %-16s  %-12s  %-20s  %-20s  %-20s  %-20s\n",
+        "────────────────","────────────","────────────────────","────────────────────","────────────────────","────────────────────"
+    # collect all test:size keys
     split("", seen)
     for (r = 2; r <= NR; r++) {
         if (!(r in rows)) continue
         split(rows[r], f, ",")
-        k = f[C_TEST]
+        k = f[C_TEST] ":" f[C_SIZE]
         if (k in seen) continue
         seen[k] = 1
         bm = (k in bw_avg_mean)  ? sprintf("%.4f", bw_avg_mean[k])  : "-"
         bp = (k in bw_peak_mean) ? sprintf("%.4f", bw_peak_mean[k]) : "-"
         lm = (k in lat_avg_mean) ? sprintf("%.4f", lat_avg_mean[k]) : "-"
         lp = (k in lat_99p_mean) ? sprintf("%.4f", lat_99p_mean[k]) : "-"
-        printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n", k, bm, bp, lm, lp
+        printf "  %-16s  %-12s  %-20s  %-20s  %-20s  %-20s\n", f[C_TEST], f[C_SIZE]"B", bm, bp, lm, lp
     }
 
     printf "\n  Anomalous pairs detected : %d\n", anomaly_count
