@@ -214,9 +214,11 @@ run_rdma_bw() {
     local target="${srv_ip:-127.0.0.1}"
     if "$bin" --ib-dev "$cli_dev" "${flags[@]}" "$target" \
             > "$outfile" 2>&1; then
-        # perftest output last data line: bytes iters bw_peak bw_avg msgrate
+        # Data lines start with whitespace + digit; filters out headers (#bytes)
+        # and trailing separator lines (------) that fool tail -1
+        # perftest BW columns: bytes  iters  bw_peak(GB/s)  bw_avg(GB/s)  msgrate
         local last
-        last=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^[[:space:]]*$' | tail -1)
+        last=$(grep -E '^\s+[0-9]' "$outfile" | tail -1)
         BW_PEAK=$(awk '{print $3}' <<< "$last")
         BW_AVG=$(awk  '{print $4}' <<< "$last")
         wait "$SRV_PID" 2>/dev/null || true; SRV_PID=""
@@ -250,9 +252,10 @@ run_rdma_lat() {
     local target="${srv_ip:-127.0.0.1}"
     if "$bin" --ib-dev "$cli_dev" "${flags[@]}" "$target" \
             > "$outfile" 2>&1; then
-        # perftest lat output last data line: bytes iters t_min t_max t_typical t_avg t_stdev 99p 99.9p
+        # Data lines start with whitespace + digit; filters headers and separator lines
+        # perftest LAT columns: bytes  iters  t_min  t_max  t_typical  t_avg  t_stdev  99p  99.9p
         local last
-        last=$(grep -v '^[[:space:]]*#' "$outfile" | grep -v '^[[:space:]]*$' | tail -1)
+        last=$(grep -E '^\s+[0-9]' "$outfile" | tail -1)
         LAT_MIN=$(awk '{print $3}' <<< "$last")
         LAT_MAX=$(awk '{print $4}' <<< "$last")
         LAT_AVG=$(awk '{print $6}' <<< "$last")
@@ -331,20 +334,156 @@ for pair in "${PAIRS[@]}"; do
     fi
 done
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-hdr "Results Summary"
-echo ""
-printf "${BOLD}%-26s %-16s %-8s %-13s %-13s %-12s %-12s${NC}\n" \
-    "Pair" "Test" "Status" "BW Avg(GB/s)" "BW Peak(GB/s)" "Lat Avg(us)" "Lat 99p(us)"
-printf '%.0s─' {1..100}; echo ""
+# ── Commit results + push parse fix to git ───────────────────────────────────
+# ── Summary table + anomaly detection ────────────────────────────────────────
+# Uses awk to:
+#   1. Compute per-test mean for each metric (bw_avg, bw_peak, lat_avg, lat_99p)
+#   2. Flag rows where any metric deviates >ANOMALY_THRESH % from its mean
+ANOMALY_THRESH=2
 
-tail -n +2 "$CSV" | while IFS=',' read -r pair srv cli test type size \
-        bw_avg bw_peak lat_min lat_max lat_avg lat_99p status; do
-    [[ "$status" == "PASS" ]] && sc="${GREEN}" || sc="${RED}"
-    printf "%-26s %-16s ${sc}%-8s${NC} %-13s %-13s %-12s %-12s\n" \
-        "$pair" "$test" "$status" \
-        "${bw_avg:--}" "${bw_peak:--}" "${lat_avg:--}" "${lat_99p:--}"
-done
+hdr "Results Summary  (anomaly threshold: ±${ANOMALY_THRESH}%)"
+
+# Write annotated summary via awk (single-pass: collect → compute means → print)
+awk -v thresh="$ANOMALY_THRESH" \
+    -v RED="$RED" -v GREEN="$GREEN" -v YELLOW="$YELLOW" \
+    -v BOLD="$BOLD" -v NC="$NC" \
+    -v CYAN="$CYAN" \
+'BEGIN {
+    FS=","
+    # column indices (1-based, header row skipped)
+    # pair,server,client,test,type,size,bw_avg,bw_peak,lat_min,lat_max,lat_avg,lat_99p,status
+    C_PAIR=1; C_TEST=4; C_TYPE=5
+    C_BW_AVG=7; C_BW_PEAK=8
+    C_LAT_AVG=11; C_LAT_99P=12
+    C_STATUS=13
+}
+NR==1 { next }   # skip CSV header
+{
+    pair   = $C_PAIR
+    test   = $C_TEST
+    type   = $C_TYPE
+    status = $C_STATUS
+    key    = test               # group anomaly detection by test binary
+
+    rows[NR] = $0               # store entire row
+
+    if (status != "PASS") next
+
+    if (type == "bandwidth") {
+        bv = $C_BW_AVG+0
+        bp = $C_BW_PEAK+0
+        if (bv > 0) { bw_avg_sum[key]  += bv; bw_avg_cnt[key]++  }
+        if (bp > 0) { bw_peak_sum[key] += bp; bw_peak_cnt[key]++ }
+    } else {
+        la = $C_LAT_AVG+0
+        l9 = $C_LAT_99P+0
+        if (la > 0) { lat_avg_sum[key] += la; lat_avg_cnt[key]++ }
+        if (l9 > 0) { lat_99p_sum[key] += l9; lat_99p_cnt[key]++ }
+    }
+}
+END {
+    # Compute means
+    for (k in bw_avg_sum)  bw_avg_mean[k]  = bw_avg_sum[k]  / bw_avg_cnt[k]
+    for (k in bw_peak_sum) bw_peak_mean[k] = bw_peak_sum[k] / bw_peak_cnt[k]
+    for (k in lat_avg_sum) lat_avg_mean[k] = lat_avg_sum[k] / lat_avg_cnt[k]
+    for (k in lat_99p_sum) lat_99p_mean[k] = lat_99p_sum[k] / lat_99p_cnt[k]
+
+    # Header
+    printf "\n"
+    printf BOLD "%-26s %-16s %-8s %-13s %-13s %-12s %-12s  %s\n" NC,
+        "Pair", "Test", "Status",
+        "BW Avg(GB/s)", "BW Peak(GB/s)", "Lat Avg(us)", "Lat 99p(us)", "Anomaly"
+    for (i=1;i<=110;i++) printf "─"; printf "\n"
+
+    anomaly_count = 0
+
+    for (r = 2; r <= NR; r++) {        # NR here is last row index
+        if (!(r in rows)) continue
+        n = split(rows[r], f, ",")
+
+        pair   = f[C_PAIR]
+        test   = f[C_TEST]
+        type   = f[C_TYPE]
+        status = f[C_STATUS]
+        key    = test
+
+        bw_avg  = f[C_BW_AVG]  + 0
+        bw_peak = f[C_BW_PEAK] + 0
+        lat_avg = f[C_LAT_AVG] + 0
+        lat_99p = f[C_LAT_99P] + 0
+
+        sc = (status == "PASS") ? GREEN : RED
+
+        anomalies = ""
+
+        if (status == "PASS") {
+            if (type == "bandwidth") {
+                if ((key in bw_avg_mean) && bw_avg_mean[key] > 0 && bw_avg > 0) {
+                    pct = (bw_avg - bw_avg_mean[key]) / bw_avg_mean[key] * 100
+                    if (pct < -thresh || pct > thresh)
+                        anomalies = anomalies sprintf(" bw_avg%+.1f%%", pct)
+                }
+                if ((key in bw_peak_mean) && bw_peak_mean[key] > 0 && bw_peak > 0) {
+                    pct = (bw_peak - bw_peak_mean[key]) / bw_peak_mean[key] * 100
+                    if (pct < -thresh || pct > thresh)
+                        anomalies = anomalies sprintf(" bw_peak%+.1f%%", pct)
+                }
+            } else {
+                if ((key in lat_avg_mean) && lat_avg_mean[key] > 0 && lat_avg > 0) {
+                    pct = (lat_avg - lat_avg_mean[key]) / lat_avg_mean[key] * 100
+                    if (pct < -thresh || pct > thresh)
+                        anomalies = anomalies sprintf(" lat_avg%+.1f%%", pct)
+                }
+                if ((key in lat_99p_mean) && lat_99p_mean[key] > 0 && lat_99p > 0) {
+                    pct = (lat_99p - lat_99p_mean[key]) / lat_99p_mean[key] * 100
+                    if (pct < -thresh || pct > thresh)
+                        anomalies = anomalies sprintf(" lat_99p%+.1f%%", pct)
+                }
+            }
+        }
+
+        bw_avg_s  = (bw_avg  > 0) ? sprintf("%.2f", bw_avg)  : (status=="PASS" ? "-" : "N/A")
+        bw_peak_s = (bw_peak > 0) ? sprintf("%.2f", bw_peak) : (status=="PASS" ? "-" : "N/A")
+        lat_avg_s = (lat_avg > 0) ? sprintf("%.2f", lat_avg) : (status=="PASS" ? "-" : "N/A")
+        lat_99p_s = (lat_99p > 0) ? sprintf("%.2f", lat_99p) : (status=="PASS" ? "-" : "N/A")
+
+        anom_col = (anomalies != "") ? YELLOW "⚠ " anomalies NC : GREEN "OK" NC
+
+        if (anomalies != "") anomaly_count++
+
+        printf "%-26s %-16s " sc "%-8s" NC " %-13s %-13s %-12s %-12s  %s\n",
+            pair, test, status,
+            bw_avg_s, bw_peak_s, lat_avg_s, lat_99p_s,
+            anom_col
+    }
+
+    printf "\n"
+    for (i=1;i<=110;i++) printf "─"; printf "\n"
+
+    # Per-test mean reference row
+    printf BOLD "\n  Per-test mean values (baseline for anomaly detection):\n" NC
+    printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n",
+        "Test", "BW Avg mean(GB/s)", "BW Peak mean(GB/s)", "Lat Avg mean(us)", "Lat 99p mean(us)"
+    printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n",
+        "────────────────","────────────────────","────────────────────","────────────────────","────────────────────"
+    # collect all test keys
+    split("", seen)
+    for (r = 2; r <= NR; r++) {
+        if (!(r in rows)) continue
+        split(rows[r], f, ",")
+        k = f[C_TEST]
+        if (k in seen) continue
+        seen[k] = 1
+        bm = (k in bw_avg_mean)  ? sprintf("%.4f", bw_avg_mean[k])  : "-"
+        bp = (k in bw_peak_mean) ? sprintf("%.4f", bw_peak_mean[k]) : "-"
+        lm = (k in lat_avg_mean) ? sprintf("%.4f", lat_avg_mean[k]) : "-"
+        lp = (k in lat_99p_mean) ? sprintf("%.4f", lat_99p_mean[k]) : "-"
+        printf "  %-16s  %-20s  %-20s  %-20s  %-20s\n", k, bm, bp, lm, lp
+    }
+
+    printf "\n  Anomalous pairs detected : %d\n", anomaly_count
+}
+' "$CSV"
 
 echo ""
 echo    "  Pairs tested : $TOTAL_PAIRS"
